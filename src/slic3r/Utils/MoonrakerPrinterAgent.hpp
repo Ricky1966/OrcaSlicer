@@ -196,6 +196,10 @@ private:
     std::atomic<bool>   ws_reconnect_requested{false};  // Flag to trigger reconnection
     std::atomic<uint64_t> ws_last_emit_ms{0};
     std::thread         ws_thread;
+    // Native handle of the status stream socket while a connection is open, -1 otherwise. A stop
+    // request shuts it down, so a read blocked on it returns instead of waiting forever.
+    std::mutex          ws_socket_mutex;
+    std::intptr_t       ws_socket = -1;
 
     // Throttling configuration for WebSocket updates
     // Critical changes (state transitions) dispatch immediately; telemetry is throttled

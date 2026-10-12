@@ -15,6 +15,11 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/algorithm/string/trim.hpp>
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <sys/socket.h>
+#endif
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/io_context.hpp>
@@ -1464,6 +1469,49 @@ void MoonrakerPrinterAgent::dispatch_printer_connected(const std::string& dev_id
     }
 }
 
+namespace {
+
+void shutdown_socket(std::intptr_t fd)
+{
+#ifdef _WIN32
+    ::shutdown(static_cast<SOCKET>(fd), SD_BOTH);
+#else
+    ::shutdown(static_cast<int>(fd), SHUT_RDWR);
+#endif
+}
+
+// Publishes an open status stream socket for stop_status_stream() while the connection lives.
+// Synchronous reads ignore the timeouts a beast stream can carry, so without this a stop request
+// could wait forever for a read that the server never answers.
+class StatusSocketRegistration
+{
+public:
+    StatusSocketRegistration(std::mutex& mutex, std::intptr_t& slot, std::intptr_t fd, const std::atomic<bool>& stop)
+        : m_mutex(mutex)
+        , m_slot(slot)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_slot = fd;
+        if (stop.load())
+            shutdown_socket(fd);
+    }
+
+    ~StatusSocketRegistration()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_slot = -1;
+    }
+
+    StatusSocketRegistration(const StatusSocketRegistration&) = delete;
+    StatusSocketRegistration& operator=(const StatusSocketRegistration&) = delete;
+
+private:
+    std::mutex& m_mutex;
+    std::intptr_t& m_slot;
+};
+
+} // namespace
+
 void MoonrakerPrinterAgent::start_status_stream(const std::string& dev_id, const std::string& base_url, const std::string& api_key)
 {
     stop_status_stream();
@@ -1478,6 +1526,11 @@ void MoonrakerPrinterAgent::start_status_stream(const std::string& dev_id, const
 void MoonrakerPrinterAgent::stop_status_stream()
 {
     ws_stop.store(true);
+    {
+        std::lock_guard<std::mutex> lock(ws_socket_mutex);
+        if (ws_socket >= 0)
+            shutdown_socket(ws_socket);
+    }
     if (ws_thread.joinable()) {
         ws_thread.join();
     }
@@ -1514,6 +1567,10 @@ void MoonrakerPrinterAgent::run_status_stream(std::string dev_id, std::string ba
             stream.connect(results);
 
             websocket::stream<beast::tcp_stream> ws{std::move(stream)};
+            // Declared after ws, so it is unpublished before the socket is destroyed.
+            StatusSocketRegistration registration(ws_socket_mutex, ws_socket,
+                                                  static_cast<std::intptr_t>(ws.next_layer().socket().native_handle()),
+                                                  ws_stop);
             ws.set_option(websocket::stream_base::decorator([&](websocket::request_type& req) {
                 req.set(http::field::user_agent, "OrcaSlicer");
                 if (!api_key.empty()) {
